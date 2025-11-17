@@ -424,12 +424,48 @@ class Memory(MemoryBase):
 
         if self.config.custom_fact_extraction_prompt:
             system_prompt = self.config.custom_fact_extraction_prompt
+
+            # Replace {categories_text} placeholder if present and categories are configured
+            if "{categories_text}" in system_prompt and self.config.memory_categories:
+                # Format categories using get_structured_fact_extraction_prompt
+                from mem0.memory.utils import get_structured_fact_extraction_prompt
+
+                # Generate formatted prompt with categories
+                formatted_prompt = get_structured_fact_extraction_prompt(self.config.memory_categories)
+
+                # Extract categories section from formatted prompt
+                # The section is between category type headers and the "重要" header
+                import re
+                categories_match = re.search(
+                    r'\*\*恒常信息\*\*.*?(?=\n\n\*\*重要\*\*|\Z)',
+                    formatted_prompt,
+                    re.DOTALL
+                )
+
+                if categories_match:
+                    categories_text = categories_match.group(0)
+                    system_prompt = system_prompt.replace("{categories_text}", categories_text)
+                    logger.info("✅ Replaced {categories_text} placeholder in custom prompt")
+                else:
+                    logger.warning("⚠️ Failed to extract categories section, using template as-is")
+
             user_prompt = f"Input:\n{parsed_messages}"
         else:
             # Determine if this should use agent memory extraction based on agent_id presence
             # and role types in messages
             is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
-            system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages, is_agent_memory)
+
+            # Use structured fact extraction if enabled and categories provided
+            categories = None
+            if self.config.enable_structured_facts and self.config.memory_categories:
+                categories = self.config.memory_categories
+                logger.info(f"Using structured fact extraction with categories: {categories}")
+
+            system_prompt, user_prompt = get_fact_retrieval_messages(
+                parsed_messages,
+                is_agent_memory,
+                categories=categories
+            )
 
         response = self.llm.generate_response(
             messages=[
@@ -446,11 +482,37 @@ class Memory(MemoryBase):
             else:
                 try:
                     # First try direct JSON parsing
-                    new_retrieved_facts = json.loads(response)["facts"]
+                    facts_response = json.loads(response)["facts"]
+
+                    # Handle both structured and legacy formats
+                    # Structured: [{"text": "...", "category": "...", "date": "..."}]
+                    # Legacy: ["text1", "text2", ...]
+                    if facts_response and isinstance(facts_response[0], dict):
+                        # Structured format - keep as is
+                        new_retrieved_facts = facts_response
+                        logger.info(f"Extracted {len(new_retrieved_facts)} structured facts")
+                    else:
+                        # Legacy format - convert to dict format for compatibility
+                        new_retrieved_facts = [
+                            {"text": fact, "category": "unknown"} if isinstance(fact, str) else fact
+                            for fact in facts_response
+                        ]
+                        logger.info(f"Extracted {len(new_retrieved_facts)} legacy facts (converted to structured)")
+
                 except json.JSONDecodeError:
                     # Try extracting JSON from response using built-in function
                     extracted_json = extract_json(response)
-                    new_retrieved_facts = json.loads(extracted_json)["facts"]
+                    facts_response = json.loads(extracted_json)["facts"]
+
+                    # Same format handling as above
+                    if facts_response and isinstance(facts_response[0], dict):
+                        new_retrieved_facts = facts_response
+                    else:
+                        new_retrieved_facts = [
+                            {"text": fact, "category": "unknown"} if isinstance(fact, str) else fact
+                            for fact in facts_response
+                        ]
+
         except Exception as e:
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
@@ -469,11 +531,33 @@ class Memory(MemoryBase):
             search_filters["agent_id"] = filters["agent_id"]
         if filters.get("run_id"):
             search_filters["run_id"] = filters["run_id"]
+        # Store category metadata for each fact
+        fact_metadata_map = {}
+
         for new_mem in new_retrieved_facts:
-            messages_embeddings = self.embedding_model.embed(new_mem, "add")
-            new_message_embeddings[new_mem] = messages_embeddings
+            # Extract text and metadata from structured fact
+            if isinstance(new_mem, dict):
+                fact_text = new_mem.get("text", "")
+                fact_category = new_mem.get("category", "unknown")
+                fact_date = new_mem.get("date")
+
+                # Store metadata for later use in memory creation
+                fact_metadata_map[fact_text] = {
+                    "category": fact_category,
+                    "date": fact_date,
+                }
+            else:
+                # Legacy format - plain string
+                fact_text = new_mem
+                fact_metadata_map[fact_text] = {
+                    "category": "unknown",
+                }
+
+            # Use text for embedding and search
+            messages_embeddings = self.embedding_model.embed(fact_text, "add")
+            new_message_embeddings[fact_text] = messages_embeddings
             existing_memories = self.vector_store.search(
-                query=new_mem,
+                query=fact_text,
                 vectors=messages_embeddings,
                 limit=5,
                 filters=search_filters,
@@ -531,11 +615,20 @@ class Memory(MemoryBase):
                         continue
 
                     event_type = resp.get("event")
+
+                    # Merge category metadata if available
+                    memory_metadata = deepcopy(metadata)
+                    if action_text in fact_metadata_map:
+                        fact_meta = fact_metadata_map[action_text]
+                        memory_metadata["category"] = fact_meta["category"]
+                        if fact_meta.get("date"):
+                            memory_metadata["date"] = fact_meta["date"]
+
                     if event_type == "ADD":
                         memory_id = self._create_memory(
                             data=action_text,
                             existing_embeddings=new_message_embeddings,
-                            metadata=deepcopy(metadata),
+                            metadata=memory_metadata,
                         )
                         returned_memories.append({"id": memory_id, "memory": action_text, "event": event_type})
                     elif event_type == "UPDATE":
@@ -543,7 +636,7 @@ class Memory(MemoryBase):
                             memory_id=temp_uuid_mapping[resp.get("id")],
                             data=action_text,
                             existing_embeddings=new_message_embeddings,
-                            metadata=deepcopy(metadata),
+                            metadata=memory_metadata,
                         )
                         returned_memories.append(
                             {
@@ -845,7 +938,23 @@ class Memory(MemoryBase):
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
             try:
+                original_count = len(original_memories)
+                logger.info(f"Applying reranking to {original_count} results...")
+
                 reranked_memories = self.reranker.rerank(query, original_memories, limit)
+
+                # Log reranking effectiveness
+                reranked_count = len(reranked_memories)
+                if reranked_count > 0 and 'rerank_score' in reranked_memories[0]:
+                    top_score = reranked_memories[0].get('rerank_score', 0)
+                    bottom_score = reranked_memories[-1].get('rerank_score', 0) if reranked_count > 1 else top_score
+                    logger.info(
+                        f"Reranking completed: {reranked_count} results, "
+                        f"score range [{bottom_score:.4f} - {top_score:.4f}]"
+                    )
+                else:
+                    logger.info(f"Reranking completed: {reranked_count} results")
+
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -1451,14 +1560,50 @@ class AsyncMemory(MemoryBase):
             return returned_memories
 
         parsed_messages = parse_messages(messages)
+
+        # Check if structured fact extraction is enabled
+        categories = None
+        if self.config.enable_structured_facts and self.config.memory_categories:
+            categories = self.config.memory_categories
+            logger.info(f"Using structured fact extraction with categories (async): {categories}")
+
         if self.config.custom_fact_extraction_prompt:
             system_prompt = self.config.custom_fact_extraction_prompt
+
+            # Replace {categories_text} placeholder if present and categories are configured
+            if "{categories_text}" in system_prompt and self.config.memory_categories:
+                # Format categories using get_structured_fact_extraction_prompt
+                from mem0.memory.utils import get_structured_fact_extraction_prompt
+
+                # Generate formatted prompt with categories
+                formatted_prompt = get_structured_fact_extraction_prompt(self.config.memory_categories)
+
+                # Extract categories section from formatted prompt
+                # The section is between category type headers and the "重要" header
+                import re
+                categories_match = re.search(
+                    r'\*\*恒常信息\*\*.*?(?=\n\n\*\*重要\*\*|\Z)',
+                    formatted_prompt,
+                    re.DOTALL
+                )
+
+                if categories_match:
+                    categories_text = categories_match.group(0)
+                    system_prompt = system_prompt.replace("{categories_text}", categories_text)
+                    logger.info("✅ Replaced {categories_text} placeholder in custom prompt (async)")
+                else:
+                    logger.warning("⚠️ Failed to extract categories section, using template as-is (async)")
+
             user_prompt = f"Input:\n{parsed_messages}"
         else:
             # Determine if this should use agent memory extraction based on agent_id presence
             # and role types in messages
             is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
-            system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages, is_agent_memory)
+            system_prompt, user_prompt = get_fact_retrieval_messages(
+                parsed_messages,
+                is_agent_memory,
+                categories=categories
+            )
 
         response = await asyncio.to_thread(
             self.llm.generate_response,
@@ -1472,11 +1617,26 @@ class AsyncMemory(MemoryBase):
             else:
                 try:
                     # First try direct JSON parsing
-                    new_retrieved_facts = json.loads(response)["facts"]
+                    facts_response = json.loads(response)["facts"]
                 except json.JSONDecodeError:
                     # Try extracting JSON from response using built-in function
                     extracted_json = extract_json(response)
-                    new_retrieved_facts = json.loads(extracted_json)["facts"]
+                    facts_response = json.loads(extracted_json)["facts"]
+
+                # Handle both structured and legacy fact formats
+                # Structured: [{"text": "...", "category": "...", "date": "..."}]
+                # Legacy: ["text1", "text2", ...]
+                if facts_response and isinstance(facts_response[0], dict):
+                    # Structured format - keep as is
+                    new_retrieved_facts = facts_response
+                    logger.info(f"Extracted {len(new_retrieved_facts)} structured facts (async)")
+                else:
+                    # Legacy format - convert to dict format for compatibility
+                    new_retrieved_facts = [
+                        {"text": fact, "category": "unknown"} if isinstance(fact, str) else fact
+                        for fact in facts_response
+                    ]
+                    logger.info(f"Extracted {len(new_retrieved_facts)} legacy facts (async, converted to structured)")
         except Exception as e:
             logger.error(f"Error in new_retrieved_facts: {e}")
             new_retrieved_facts = []
@@ -1486,6 +1646,9 @@ class AsyncMemory(MemoryBase):
 
         retrieved_old_memory = []
         new_message_embeddings = {}
+        # Store category metadata for each fact (async)
+        fact_metadata_map = {}
+
         # Search for existing memories using the provided session identifiers
         # Use all available session identifiers for accurate memory retrieval
         search_filters = {}
@@ -1496,12 +1659,31 @@ class AsyncMemory(MemoryBase):
         if effective_filters.get("run_id"):
             search_filters["run_id"] = effective_filters["run_id"]
 
-        async def process_fact_for_search(new_mem_content):
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, new_mem_content, "add")
-            new_message_embeddings[new_mem_content] = embeddings
+        async def process_fact_for_search(new_mem):
+            # Extract text and metadata from structured fact
+            if isinstance(new_mem, dict):
+                fact_text = new_mem.get("text", "")
+                fact_category = new_mem.get("category", "unknown")
+                fact_date = new_mem.get("date")
+
+                # Store metadata for later use in memory creation
+                fact_metadata_map[fact_text] = {
+                    "category": fact_category,
+                    "date": fact_date,
+                }
+            else:
+                # Legacy format - plain string
+                fact_text = new_mem
+                fact_metadata_map[fact_text] = {
+                    "category": "unknown",
+                }
+
+            # Use text for embedding and search
+            embeddings = await asyncio.to_thread(self.embedding_model.embed, fact_text, "add")
+            new_message_embeddings[fact_text] = embeddings
             existing_mems = await asyncio.to_thread(
                 self.vector_store.search,
-                query=new_mem_content,
+                query=fact_text,
                 vectors=embeddings,
                 limit=5,
                 filters=search_filters,
@@ -1560,12 +1742,20 @@ class AsyncMemory(MemoryBase):
                         continue
                     event_type = resp.get("event")
 
+                    # Merge category metadata if available (async)
+                    memory_metadata = deepcopy(metadata)
+                    if action_text in fact_metadata_map:
+                        fact_meta = fact_metadata_map[action_text]
+                        memory_metadata["category"] = fact_meta["category"]
+                        if fact_meta.get("date"):
+                            memory_metadata["date"] = fact_meta["date"]
+
                     if event_type == "ADD":
                         task = asyncio.create_task(
                             self._create_memory(
                                 data=action_text,
                                 existing_embeddings=new_message_embeddings,
-                                metadata=deepcopy(metadata),
+                                metadata=memory_metadata,
                             )
                         )
                         memory_tasks.append((task, resp, "ADD", None))
@@ -1575,7 +1765,7 @@ class AsyncMemory(MemoryBase):
                                 memory_id=temp_uuid_mapping[resp["id"]],
                                 data=action_text,
                                 existing_embeddings=new_message_embeddings,
-                                metadata=deepcopy(metadata),
+                                metadata=memory_metadata,
                             )
                         )
                         memory_tasks.append((task, resp, "UPDATE", temp_uuid_mapping[resp["id"]]))
@@ -1898,10 +2088,26 @@ class AsyncMemory(MemoryBase):
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
             try:
+                original_count = len(original_memories)
+                logger.info(f"Applying reranking to {original_count} results...")
+
                 # Run reranking in thread pool to avoid blocking async loop
                 reranked_memories = await asyncio.to_thread(
                     self.reranker.rerank, query, original_memories, limit
                 )
+
+                # Log reranking effectiveness
+                reranked_count = len(reranked_memories)
+                if reranked_count > 0 and 'rerank_score' in reranked_memories[0]:
+                    top_score = reranked_memories[0].get('rerank_score', 0)
+                    bottom_score = reranked_memories[-1].get('rerank_score', 0) if reranked_count > 1 else top_score
+                    logger.info(
+                        f"Reranking completed: {reranked_count} results, "
+                        f"score range [{bottom_score:.4f} - {top_score:.4f}]"
+                    )
+                else:
+                    logger.info(f"Reranking completed: {reranked_count} results")
+
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
