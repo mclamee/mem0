@@ -289,6 +289,7 @@ class Memory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        categories: Optional[Dict[str, Any]] = None,
     ):
         """
         Create a new memory.
@@ -309,8 +310,11 @@ class Memory(MemoryBase):
             memory_type (str, optional): Specifies the type of memory. Currently, only
                 `MemoryType.PROCEDURAL.value` ("procedural_memory") is explicitly handled for
                 creating procedural memories (typically requires 'agent_id'). Otherwise, memories
-                are treated as general conversational/factual memories.memory_type (str, optional): Type of memory to create. Defaults to None. By default, it creates the short term memories and long term (semantic and episodic) memories. Pass "procedural_memory" to create procedural memories.
-            prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
+                are treated as general conversational/factual memories.
+            prompt (str, optional): Prompt to use for procedural memory creation. Defaults to None.
+            categories (dict, optional): Categories configuration for structured fact extraction.
+                If provided, will replace `{categories_text}` placeholder in custom_fact_extraction_prompt.
+                Overrides `config.fact_categories`.
 
 
         Returns:
@@ -367,7 +371,14 @@ class Memory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer)
+            future1 = executor.submit(
+                self._add_to_vector_store,
+                messages,
+                processed_metadata,
+                effective_filters,
+                infer,
+                categories=categories
+            )
             future2 = executor.submit(self._add_to_graph, messages, effective_filters)
 
             concurrent.futures.wait([future1, future2])
@@ -383,7 +394,7 @@ class Memory(MemoryBase):
 
         return {"results": vector_store_result}
 
-    def _add_to_vector_store(self, messages, metadata, filters, infer):
+    def _add_to_vector_store(self, messages, metadata, filters, infer, categories=None):
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -422,36 +433,60 @@ class Memory(MemoryBase):
 
         parsed_messages = parse_messages(messages)
 
-        if self.config.custom_fact_extraction_prompt:
-            system_prompt = self.config.custom_fact_extraction_prompt
+        # Determine if this should use agent memory extraction
+        is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
+
+        # Priority: call-time categories > config fact_categories
+        effective_categories = categories or self.config.fact_categories
+
+        # Select custom prompt based on memory type
+        # Priority: new specific prompts > legacy custom_fact_extraction_prompt > default
+        if is_agent_memory:
+            effective_prompt = self.config.custom_agent_memory_prompt or self.config.custom_fact_extraction_prompt
+        else:
+            effective_prompt = self.config.custom_user_memory_prompt or self.config.custom_fact_extraction_prompt
+
+        if effective_prompt:
+            system_prompt = effective_prompt
 
             # Replace {categories_text} placeholder if present and categories are configured
-            if "{categories_text}" in system_prompt and self.config.fact_categories:
+            if "{categories_text}" in system_prompt and effective_categories:
                 from mem0.memory.utils import format_fact_categories
 
                 # Format categories into text representation
-                categories_text = format_fact_categories(self.config.fact_categories)
+                categories_text = format_fact_categories(effective_categories)
 
                 # Replace placeholder with formatted categories
                 system_prompt = system_prompt.replace("{categories_text}", categories_text)
-                logger.info("✅ Replaced {categories_text} placeholder in custom prompt")
+                logger.info(f"✅ Replaced {{categories_text}} placeholder in {'agent' if is_agent_memory else 'user'} memory prompt")
+
+            # Replace {current_date} placeholder with today's date
+            if "{current_date}" in system_prompt:
+                from datetime import datetime
+                current_date = datetime.now().strftime("%Y-%m-%d")
+                system_prompt = system_prompt.replace("{current_date}", current_date)
+                logger.info(f"✅ Replaced {{current_date}} placeholder with {current_date}")
+
+            # Replace {category_names} placeholder with list of category names
+            if "{category_names}" in system_prompt and effective_categories:
+                import json
+                category_names = list(effective_categories.keys())
+                category_names_str = json.dumps(category_names, ensure_ascii=False)
+                system_prompt = system_prompt.replace("{category_names}", category_names_str)
+                logger.info(f"✅ Replaced {{category_names}} placeholder")
 
             user_prompt = f"Input:\n{parsed_messages}"
         else:
-            # Determine if this should use agent memory extraction based on agent_id presence
-            # and role types in messages
-            is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
-
-            # Use structured fact extraction if enabled and categories provided
-            categories = None
-            if self.config.enable_structured_facts and self.config.fact_categories:
-                categories = self.config.fact_categories
-                logger.info(f"Using structured fact extraction with categories: {categories}")
+            # Use default prompts with structured fact extraction if enabled
+            use_categories = None
+            if self.config.enable_structured_facts and effective_categories:
+                use_categories = effective_categories
+                logger.info(f"Using structured fact extraction with categories: {use_categories}")
 
             system_prompt, user_prompt = get_fact_retrieval_messages(
                 parsed_messages,
                 is_agent_memory,
-                categories=categories
+                categories=use_categories
             )
 
         response = self.llm.generate_response(
@@ -525,14 +560,20 @@ class Memory(MemoryBase):
             # Extract text and metadata from structured fact
             if isinstance(new_mem, dict):
                 fact_text = new_mem.get("text", "")
-                fact_category = new_mem.get("category", "unknown")
-                fact_date = new_mem.get("date")
 
-                # Store metadata for later use in memory creation
-                fact_metadata_map[fact_text] = {
-                    "category": fact_category,
-                    "date": fact_date,
-                }
+                # Extract all metadata fields dynamically (except 'text')
+                # This allows custom prompts to add any metadata fields like 'role', 'source', etc.
+                fact_metadata = {}
+                for key, value in new_mem.items():
+                    if key != "text":  # Skip the text field, keep everything else as metadata
+                        fact_metadata[key] = value
+
+                # Ensure category has a default value
+                if "category" not in fact_metadata:
+                    fact_metadata["category"] = "unknown"
+
+                # Store all metadata for later use in memory creation
+                fact_metadata_map[fact_text] = fact_metadata
             else:
                 # Legacy format - plain string
                 fact_text = new_mem
@@ -603,13 +644,15 @@ class Memory(MemoryBase):
 
                     event_type = resp.get("event")
 
-                    # Merge category metadata if available
+                    # Merge all metadata fields dynamically
                     memory_metadata = deepcopy(metadata)
                     if action_text in fact_metadata_map:
                         fact_meta = fact_metadata_map[action_text]
-                        memory_metadata["category"] = fact_meta["category"]
-                        if fact_meta.get("date"):
-                            memory_metadata["date"] = fact_meta["date"]
+                        # Copy all metadata fields from fact extraction
+                        # This supports custom fields like 'role', 'source', 'confidence', etc.
+                        for key, value in fact_meta.items():
+                            if value is not None:  # Only set non-None values
+                                memory_metadata[key] = value
 
                     if event_type == "ADD":
                         memory_id = self._create_memory(
@@ -1435,6 +1478,7 @@ class AsyncMemory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        categories: Optional[Dict[str, Any]] = None,
         llm=None,
     ):
         """
@@ -1449,8 +1493,10 @@ class AsyncMemory(MemoryBase):
             infer (bool, optional): Whether to infer the memories. Defaults to True.
             memory_type (str, optional): Type of memory to create. Defaults to None.
                                          Pass "procedural_memory" to create procedural memories.
-            prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
-            llm (BaseChatModel, optional): LLM class to use for generating procedural memories. Defaults to None. Useful when user is using LangChain ChatModel.
+            prompt (str, optional): Prompt to use for procedural memory creation. Defaults to None.
+            categories (dict, optional): Categories for structured fact extraction.
+                If provided, will replace {categories_text} placeholder in custom prompts.
+            llm (BaseChatModel, optional): LLM class to use for generating procedural memories.
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
         """
@@ -1489,7 +1535,13 @@ class AsyncMemory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         vector_store_task = asyncio.create_task(
-            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+            self._add_to_vector_store(
+                messages,
+                processed_metadata,
+                effective_filters,
+                infer,
+                categories=categories
+            )
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 

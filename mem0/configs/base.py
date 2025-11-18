@@ -57,7 +57,15 @@ class MemoryConfig(BaseModel):
         default="v1.1",
     )
     custom_fact_extraction_prompt: Optional[str] = Field(
-        description="Custom prompt for the fact extraction",
+        description="Custom prompt for the fact extraction (legacy, use custom_user_memory_prompt instead)",
+        default=None,
+    )
+    custom_user_memory_prompt: Optional[str] = Field(
+        description="Custom prompt for user memory extraction (from user messages)",
+        default=None,
+    )
+    custom_agent_memory_prompt: Optional[str] = Field(
+        description="Custom prompt for agent memory extraction (from assistant messages)",
         default=None,
     )
     custom_update_memory_prompt: Optional[str] = Field(
