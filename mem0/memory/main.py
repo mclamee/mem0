@@ -426,28 +426,15 @@ class Memory(MemoryBase):
             system_prompt = self.config.custom_fact_extraction_prompt
 
             # Replace {categories_text} placeholder if present and categories are configured
-            if "{categories_text}" in system_prompt and self.config.memory_categories:
-                # Format categories using get_structured_fact_extraction_prompt
-                from mem0.memory.utils import get_structured_fact_extraction_prompt
+            if "{categories_text}" in system_prompt and self.config.fact_categories:
+                from mem0.memory.utils import format_fact_categories
 
-                # Generate formatted prompt with categories
-                formatted_prompt = get_structured_fact_extraction_prompt(self.config.memory_categories)
+                # Format categories into text representation
+                categories_text = format_fact_categories(self.config.fact_categories)
 
-                # Extract categories section from formatted prompt
-                # The section is between category type headers and the "重要" header
-                import re
-                categories_match = re.search(
-                    r'\*\*恒常信息\*\*.*?(?=\n\n\*\*重要\*\*|\Z)',
-                    formatted_prompt,
-                    re.DOTALL
-                )
-
-                if categories_match:
-                    categories_text = categories_match.group(0)
-                    system_prompt = system_prompt.replace("{categories_text}", categories_text)
-                    logger.info("✅ Replaced {categories_text} placeholder in custom prompt")
-                else:
-                    logger.warning("⚠️ Failed to extract categories section, using template as-is")
+                # Replace placeholder with formatted categories
+                system_prompt = system_prompt.replace("{categories_text}", categories_text)
+                logger.info("✅ Replaced {categories_text} placeholder in custom prompt")
 
             user_prompt = f"Input:\n{parsed_messages}"
         else:
@@ -457,8 +444,8 @@ class Memory(MemoryBase):
 
             # Use structured fact extraction if enabled and categories provided
             categories = None
-            if self.config.enable_structured_facts and self.config.memory_categories:
-                categories = self.config.memory_categories
+            if self.config.enable_structured_facts and self.config.fact_categories:
+                categories = self.config.fact_categories
                 logger.info(f"Using structured fact extraction with categories: {categories}")
 
             system_prompt, user_prompt = get_fact_retrieval_messages(
@@ -1563,36 +1550,23 @@ class AsyncMemory(MemoryBase):
 
         # Check if structured fact extraction is enabled
         categories = None
-        if self.config.enable_structured_facts and self.config.memory_categories:
-            categories = self.config.memory_categories
+        if self.config.enable_structured_facts and self.config.fact_categories:
+            categories = self.config.fact_categories
             logger.info(f"Using structured fact extraction with categories (async): {categories}")
 
         if self.config.custom_fact_extraction_prompt:
             system_prompt = self.config.custom_fact_extraction_prompt
 
             # Replace {categories_text} placeholder if present and categories are configured
-            if "{categories_text}" in system_prompt and self.config.memory_categories:
-                # Format categories using get_structured_fact_extraction_prompt
-                from mem0.memory.utils import get_structured_fact_extraction_prompt
+            if "{categories_text}" in system_prompt and self.config.fact_categories:
+                from mem0.memory.utils import format_fact_categories
 
-                # Generate formatted prompt with categories
-                formatted_prompt = get_structured_fact_extraction_prompt(self.config.memory_categories)
+                # Format categories into text representation
+                categories_text = format_fact_categories(self.config.fact_categories)
 
-                # Extract categories section from formatted prompt
-                # The section is between category type headers and the "重要" header
-                import re
-                categories_match = re.search(
-                    r'\*\*恒常信息\*\*.*?(?=\n\n\*\*重要\*\*|\Z)',
-                    formatted_prompt,
-                    re.DOTALL
-                )
-
-                if categories_match:
-                    categories_text = categories_match.group(0)
-                    system_prompt = system_prompt.replace("{categories_text}", categories_text)
-                    logger.info("✅ Replaced {categories_text} placeholder in custom prompt (async)")
-                else:
-                    logger.warning("⚠️ Failed to extract categories section, using template as-is (async)")
+                # Replace placeholder with formatted categories
+                system_prompt = system_prompt.replace("{categories_text}", categories_text)
+                logger.info("✅ Replaced {categories_text} placeholder in custom prompt (async)")
 
             user_prompt = f"Input:\n{parsed_messages}"
         else:

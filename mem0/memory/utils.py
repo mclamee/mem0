@@ -156,6 +156,85 @@ def process_telemetry_filters(filters):
     return list(filters.keys()), encoded_ids
 
 
+def format_fact_categories(categories: dict) -> str:
+    """
+    Format fact categories dictionary into a text representation for prompt injection.
+
+    This function converts the categories configuration into a formatted string that can
+    replace the {categories_text} placeholder in custom fact extraction prompts.
+
+    Args:
+        categories: Dictionary of category configurations with structure:
+            {
+                'category_name': {
+                    'description': str,
+                    'examples': list[str],
+                    'temporal': bool
+                }
+            }
+
+    Returns:
+        Formatted string representation of categories for prompt injection
+
+    Example:
+        >>> categories = {
+        ...     'preference': {
+        ...         'description': '个人偏好',
+        ...         'examples': ['用户喜欢披萨'],
+        ...         'temporal': False
+        ...     }
+        ... }
+        >>> print(format_fact_categories(categories))
+        **恒常信息** (Permanent - 无需日期)
+
+        - **preference** (个人偏好)
+          示例: 用户喜欢披萨
+    """
+    if not categories:
+        return ""
+
+    # Separate categories by temporal type
+    permanent_cats = []
+    temporal_cats = []
+
+    for cat_name, cat_config in categories.items():
+        is_temporal = cat_config.get('temporal', False)
+        description = cat_config.get('description', '')
+        examples = cat_config.get('examples', [])
+
+        # Format category entry
+        category_text = f"- **{cat_name}**"
+        if description:
+            category_text += f" ({description})"
+
+        # Add examples if available
+        if examples:
+            examples_str = ", ".join(examples[:3])  # Limit to 3 examples
+            category_text += f"\n  示例: {examples_str}"
+
+        if is_temporal:
+            temporal_cats.append(category_text)
+        else:
+            permanent_cats.append(category_text)
+
+    # Build formatted output
+    result = []
+
+    if permanent_cats:
+        result.append("**恒常信息** (Permanent - 无需日期)")
+        result.append("")
+        result.extend(permanent_cats)
+
+    if temporal_cats:
+        if permanent_cats:
+            result.append("")  # Add spacing between sections
+        result.append("**时序信息** (Temporal - 需要日期)")
+        result.append("")
+        result.extend(temporal_cats)
+
+    return "\n".join(result)
+
+
 def sanitize_relationship_for_cypher(relationship) -> str:
     """Sanitize relationship text for Cypher queries by replacing problematic characters."""
     char_map = {

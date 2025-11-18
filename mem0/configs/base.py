@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -63,6 +63,26 @@ class MemoryConfig(BaseModel):
     custom_update_memory_prompt: Optional[str] = Field(
         description="Custom prompt for the update memory",
         default=None,
+    )
+    fact_categories: Optional[Union[list[str], dict[str, dict]]] = Field(
+        description="Fact categories for memory extraction. Supports:\n"
+                    "1. Simple list: ['preference', 'plan', 'conversation']\n"
+                    "2. Detailed dict: {\n"
+                    "     'preference': {'description': '个人偏好', 'examples': ['喜欢披萨'], 'temporal': False},\n"
+                    "     'plan': {'description': '计划意图', 'examples': ['计划去日本'], 'temporal': True}\n"
+                    "   }\n"
+                    "3. Mixed mode (use defaults + custom): {\n"
+                    "     'preference': 'use_default',  # Use built-in default config\n"
+                    "     'plan': 'use_default',\n"
+                    "     'astro_question': {'description': '...', 'examples': [...], 'temporal': True}\n"
+                    "   }",
+        default=None,
+    )
+    enable_structured_facts: bool = Field(
+        description="Enable structured fact extraction with category metadata. "
+                    "When True, facts are extracted as {'text': '...', 'category': '...', 'date': '...'} "
+                    "instead of plain strings. Requires fact_categories to be set.",
+        default=False,
     )
 
 
