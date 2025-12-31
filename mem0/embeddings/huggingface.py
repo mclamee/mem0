@@ -1,15 +1,10 @@
 import logging
 from typing import Literal, Optional
 
-from openai import OpenAI
-from sentence_transformers import SentenceTransformer
-
 from mem0.configs.embeddings.base import BaseEmbedderConfig
 from mem0.embeddings.base import EmbeddingBase
 
-logging.getLogger("transformers").setLevel(logging.WARNING)
-logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 class HuggingFaceEmbedding(EmbeddingBase):
@@ -17,14 +12,33 @@ class HuggingFaceEmbedding(EmbeddingBase):
         super().__init__(config)
 
         if config.huggingface_base_url:
+            # HTTP API mode (TEI) - no local dependencies needed
+            from openai import OpenAI
+
             self.client = OpenAI(base_url=config.huggingface_base_url)
             self.config.model = self.config.model or "tei"
+            self.model = None  # Not used in HTTP API mode
+            logger.info(f"HuggingFaceEmbedding initialized in HTTP API mode: {config.huggingface_base_url}")
         else:
+            # Local mode - requires sentence_transformers
+            try:
+                from sentence_transformers import SentenceTransformer
+
+                logging.getLogger("transformers").setLevel(logging.WARNING)
+                logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+                logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+            except ImportError:
+                raise ImportError(
+                    "sentence_transformers is required for local HuggingFace embedding mode. "
+                    "Install with: pip install sentence-transformers\n"
+                    "Or use HTTP API mode by setting huggingface_base_url in config."
+                )
+
             self.config.model = self.config.model or "multi-qa-MiniLM-L6-cos-v1"
-
             self.model = SentenceTransformer(self.config.model, **self.config.model_kwargs)
-
             self.config.embedding_dims = self.config.embedding_dims or self.model.get_sentence_embedding_dimension()
+            self.client = None  # Not used in local mode
+            logger.info(f"HuggingFaceEmbedding initialized in local mode: {self.config.model}")
 
     def embed(self, text, memory_action: Optional[Literal["add", "search", "update"]] = None):
         """
