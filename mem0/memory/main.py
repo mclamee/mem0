@@ -572,6 +572,10 @@ class Memory(MemoryBase):
                 if "category" not in fact_metadata:
                     fact_metadata["category"] = "unknown"
 
+                # Prepend date to fact text if date exists (e.g., "2025-01-01，用户准备去上海")
+                if fact_metadata.get("date"):
+                    fact_text = f"{fact_metadata['date']}，{fact_text}"
+
                 # Store all metadata for later use in memory creation
                 fact_metadata_map[fact_text] = fact_metadata
             else:
@@ -598,6 +602,7 @@ class Memory(MemoryBase):
             unique_data[item["id"]] = item
         retrieved_old_memory = list(unique_data.values())
         logger.info(f"Total existing memories: {len(retrieved_old_memory)}")
+        logger.info(f"[DEBUG-SYNC] new_retrieved_facts count: {len(new_retrieved_facts)}, calling LLM for update...")
 
         # mapping UUIDs with integers for handling UUID hallucinations
         temp_uuid_mapping = {}
@@ -606,8 +611,19 @@ class Memory(MemoryBase):
             retrieved_old_memory[idx]["id"] = str(idx)
 
         if new_retrieved_facts:
+            # Convert structured facts to plain text array for update prompt
+            # Use date-prefixed text so LLM returns text matching our cache key
+            def format_fact_text(fact):
+                if isinstance(fact, dict):
+                    text = fact.get("text", "")
+                    date = fact.get("date")
+                    # Return date-prefixed text for temporal facts
+                    return f"{date}，{text}" if date else text
+                return fact
+
+            facts_for_update = [format_fact_text(fact) for fact in new_retrieved_facts]
             function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                retrieved_old_memory, facts_for_update, self.config.custom_update_memory_prompt
             )
 
             try:
@@ -1216,6 +1232,8 @@ class Memory(MemoryBase):
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
+            # Cache miss - generate embedding
+            logger.debug(f"Cache miss for data='{data}', generating new embedding")
             embeddings = self.embedding_model.embed(data, memory_action="add")
         memory_id = str(uuid.uuid4())
         metadata = metadata or {}
@@ -1311,6 +1329,7 @@ class Memory(MemoryBase):
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
+            # Cache miss - generate embedding
             embeddings = self.embedding_model.embed(data, "update")
 
         self.vector_store.update(
@@ -1561,6 +1580,7 @@ class AsyncMemory(MemoryBase):
         metadata: dict,
         effective_filters: dict,
         infer: bool,
+        categories=None,
     ):
         if not infer:
             returned_memories = []
@@ -1600,35 +1620,55 @@ class AsyncMemory(MemoryBase):
 
         parsed_messages = parse_messages(messages)
 
-        # Check if structured fact extraction is enabled
-        categories = None
-        if self.config.enable_structured_facts and self.config.fact_categories:
-            categories = self.config.fact_categories
-            logger.info(f"Using structured fact extraction with categories (async): {categories}")
+        # Determine if this should use agent memory extraction
+        is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
 
-        if self.config.custom_fact_extraction_prompt:
-            system_prompt = self.config.custom_fact_extraction_prompt
+        # Priority: call-time categories > config fact_categories
+        effective_categories = categories or self.config.fact_categories
+        if effective_categories:
+            logger.info(f"Using structured fact extraction with {len(effective_categories)} categories (async)")
+
+        # Select custom prompt based on memory type
+        # Priority: new specific prompts > legacy custom_fact_extraction_prompt > default
+        if is_agent_memory:
+            effective_prompt = self.config.custom_agent_memory_prompt or self.config.custom_fact_extraction_prompt
+        else:
+            effective_prompt = self.config.custom_user_memory_prompt or self.config.custom_fact_extraction_prompt
+
+        if effective_prompt:
+            system_prompt = effective_prompt
 
             # Replace {categories_text} placeholder if present and categories are configured
-            if "{categories_text}" in system_prompt and self.config.fact_categories:
+            if "{categories_text}" in system_prompt and effective_categories:
                 from mem0.memory.utils import format_fact_categories
 
                 # Format categories into text representation
-                categories_text = format_fact_categories(self.config.fact_categories)
+                categories_text = format_fact_categories(effective_categories)
 
                 # Replace placeholder with formatted categories
                 system_prompt = system_prompt.replace("{categories_text}", categories_text)
-                logger.info("✅ Replaced {categories_text} placeholder in custom prompt (async)")
+                logger.info(f"✅ Replaced {{categories_text}} placeholder in {'agent' if is_agent_memory else 'user'} memory prompt (async)")
+
+            # Replace {current_date} placeholder with today's date
+            if "{current_date}" in system_prompt:
+                from datetime import datetime
+                current_date = datetime.now().strftime("%Y-%m-%d")
+                system_prompt = system_prompt.replace("{current_date}", current_date)
+                logger.info(f"✅ Replaced {{current_date}} placeholder with {current_date} (async)")
+
+            # Replace {category_names} placeholder with list of category names
+            if "{category_names}" in system_prompt and effective_categories:
+                import json
+                category_names = list(effective_categories.keys())
+                system_prompt = system_prompt.replace("{category_names}", json.dumps(category_names, ensure_ascii=False))
+                logger.info(f"✅ Replaced {{category_names}} placeholder (async)")
 
             user_prompt = f"Input:\n{parsed_messages}"
         else:
-            # Determine if this should use agent memory extraction based on agent_id presence
-            # and role types in messages
-            is_agent_memory = self._should_use_agent_memory_extraction(messages, metadata)
             system_prompt, user_prompt = get_fact_retrieval_messages(
                 parsed_messages,
                 is_agent_memory,
-                categories=categories
+                categories=effective_categories
             )
 
         response = await asyncio.to_thread(
@@ -1688,28 +1728,36 @@ class AsyncMemory(MemoryBase):
         async def process_fact_for_search(new_mem):
             # Extract text and metadata from structured fact
             if isinstance(new_mem, dict):
-                fact_text = new_mem.get("text", "")
+                original_text = new_mem.get("text", "")
                 fact_category = new_mem.get("category", "unknown")
                 fact_date = new_mem.get("date")
 
-                # Store metadata for later use in memory creation
-                fact_metadata_map[fact_text] = {
+                # Create search text with date prefix for better semantic search
+                # e.g., "2025-01-01，用户准备去上海"
+                if fact_date:
+                    search_text = f"{fact_date}，{original_text}"
+                else:
+                    search_text = original_text
+
+                # Store metadata for later use
+                fact_metadata_map[search_text] = {
                     "category": fact_category,
                     "date": fact_date,
                 }
             else:
                 # Legacy format - plain string
-                fact_text = new_mem
-                fact_metadata_map[fact_text] = {
+                search_text = new_mem
+                fact_metadata_map[search_text] = {
                     "category": "unknown",
                 }
 
-            # Use text for embedding and search
-            embeddings = await asyncio.to_thread(self.embedding_model.embed, fact_text, "add")
-            new_message_embeddings[fact_text] = embeddings
+            # Use search_text (with date prefix) as cache key
+            # This matches what format_fact_text will return to LLM
+            embeddings = await asyncio.to_thread(self.embedding_model.embed, search_text, "add")
+            new_message_embeddings[search_text] = embeddings
             existing_mems = await asyncio.to_thread(
                 self.vector_store.search,
-                query=fact_text,
+                query=search_text,
                 vectors=embeddings,
                 limit=5,
                 filters=search_filters,
@@ -1717,9 +1765,14 @@ class AsyncMemory(MemoryBase):
             return [{"id": mem.id, "text": mem.payload.get("data", "")} for mem in existing_mems]
 
         search_tasks = [process_fact_for_search(fact) for fact in new_retrieved_facts]
-        search_results_list = await asyncio.gather(*search_tasks)
-        for result_group in search_results_list:
-            retrieved_old_memory.extend(result_group)
+        try:
+            search_results_list = await asyncio.gather(*search_tasks)
+            for result_group in search_results_list:
+                retrieved_old_memory.extend(result_group)
+        except Exception as e:
+            logger.error(f"[DEBUG] Error in search_tasks gather: {e}")
+            import traceback
+            traceback.print_exc()
 
         unique_data = {}
         for item in retrieved_old_memory:
@@ -1730,17 +1783,29 @@ class AsyncMemory(MemoryBase):
         for idx, item in enumerate(retrieved_old_memory):
             temp_uuid_mapping[str(idx)] = item["id"]
             retrieved_old_memory[idx]["id"] = str(idx)
-
         if new_retrieved_facts:
+            # Convert structured facts to plain text array for update prompt
+            # Use date-prefixed text so LLM returns text matching our cache key
+            def format_fact_text(fact):
+                if isinstance(fact, dict):
+                    text = fact.get("text", "")
+                    date = fact.get("date")
+                    # Return date-prefixed text for temporal facts
+                    return f"{date}，{text}" if date else text
+                return fact
+
+            facts_for_update = [format_fact_text(fact) for fact in new_retrieved_facts]
             function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                retrieved_old_memory, facts_for_update, self.config.custom_update_memory_prompt
             )
+            logger.info(f"[DEBUG] Calling LLM for memory update with {len(new_retrieved_facts)} facts...")
             try:
                 response = await asyncio.to_thread(
                     self.llm.generate_response,
                     messages=[{"role": "user", "content": function_calling_prompt}],
                     response_format={"type": "json_object"},
                 )
+                logger.info(f"[DEBUG] LLM response received: {len(response) if response else 0} chars")
             except Exception as e:
                 logger.error(f"Error in new memory actions response: {e}")
                 response = ""
@@ -1751,11 +1816,13 @@ class AsyncMemory(MemoryBase):
                 else:
                     response = remove_code_blocks(response)
                     new_memories_with_actions = json.loads(response)
+                    logger.info(f"[DEBUG] Parsed JSON with {len(new_memories_with_actions.get('memory', []))} memory actions")
             except Exception as e:
-                logger.error(f"Invalid JSON response: {e}")
+                logger.error(f"Invalid JSON response: {e}, response preview: {response[:200] if response else 'None'}")
                 new_memories_with_actions = {}
         else:
             new_memories_with_actions = {}
+            logger.info("[DEBUG] No new facts to process")
 
         returned_memories = []
         try:
@@ -1763,23 +1830,24 @@ class AsyncMemory(MemoryBase):
             for resp in new_memories_with_actions.get("memory", []):
                 logger.info(resp)
                 try:
-                    action_text = resp.get("text")
+                    action_text = resp.get("text")  # Original text from LLM (cache lookup key)
                     if not action_text:
                         continue
                     event_type = resp.get("event")
 
                     # Merge category metadata if available (async)
                     memory_metadata = deepcopy(metadata)
+                    # action_text is already date-prefixed from format_fact_text
                     if action_text in fact_metadata_map:
                         fact_meta = fact_metadata_map[action_text]
-                        memory_metadata["category"] = fact_meta["category"]
+                        memory_metadata["category"] = fact_meta.get("category", "unknown")
                         if fact_meta.get("date"):
                             memory_metadata["date"] = fact_meta["date"]
 
                     if event_type == "ADD":
                         task = asyncio.create_task(
                             self._create_memory(
-                                data=action_text,
+                                data=action_text,  # Already date-prefixed
                                 existing_embeddings=new_message_embeddings,
                                 metadata=memory_metadata,
                             )
@@ -1789,7 +1857,7 @@ class AsyncMemory(MemoryBase):
                         task = asyncio.create_task(
                             self._update_memory(
                                 memory_id=temp_uuid_mapping[resp["id"]],
-                                data=action_text,
+                                data=action_text,  # Already date-prefixed
                                 existing_embeddings=new_message_embeddings,
                                 metadata=memory_metadata,
                             )
@@ -2366,10 +2434,18 @@ class AsyncMemory(MemoryBase):
         return await asyncio.to_thread(self.db.get_history, memory_id)
 
     async def _create_memory(self, data, existing_embeddings, metadata=None):
-        logger.debug(f"Creating memory with {data=}")
+        """
+        Create a memory with the given data and embeddings.
+
+        Args:
+            data: The text to store as memory content (may be date-prefixed)
+            existing_embeddings: Dict of cached embeddings
+            metadata: Additional metadata for the memory
+        """
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
+            # Cache miss - generate embedding
             embeddings = await asyncio.to_thread(self.embedding_model.embed, data, memory_action="add")
 
         memory_id = str(uuid.uuid4())
@@ -2452,6 +2528,15 @@ class AsyncMemory(MemoryBase):
         return result
 
     async def _update_memory(self, memory_id, data, existing_embeddings, metadata=None):
+        """
+        Update a memory with the given data and embeddings.
+
+        Args:
+            memory_id: ID of memory to update
+            data: The text to store as memory content (may be date-prefixed)
+            existing_embeddings: Dict of cached embeddings
+            metadata: Additional metadata for the memory
+        """
         logger.info(f"Updating memory with {data=}")
 
         try:
@@ -2485,6 +2570,7 @@ class AsyncMemory(MemoryBase):
         if data in existing_embeddings:
             embeddings = existing_embeddings[data]
         else:
+            # Cache miss - generate embedding
             embeddings = await asyncio.to_thread(self.embedding_model.embed, data, "update")
 
         await asyncio.to_thread(
