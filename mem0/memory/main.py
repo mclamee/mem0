@@ -707,19 +707,22 @@ class Memory(MemoryBase):
                         if memory_id and (metadata.get("agent_id") or metadata.get("run_id")):
                             # Update only the session identifiers, keep content the same
                             existing_memory = self.vector_store.get(vector_id=memory_id)
-                            updated_metadata = deepcopy(existing_memory.payload)
-                            if metadata.get("agent_id"):
-                                updated_metadata["agent_id"] = metadata["agent_id"]
-                            if metadata.get("run_id"):
-                                updated_metadata["run_id"] = metadata["run_id"]
-                            updated_metadata["updated_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
+                            if existing_memory is None:
+                                logger.warning(f"Memory {memory_id} not found (may have been deleted), skipping session ID update")
+                            else:
+                                updated_metadata = deepcopy(existing_memory.payload)
+                                if metadata.get("agent_id"):
+                                    updated_metadata["agent_id"] = metadata["agent_id"]
+                                if metadata.get("run_id"):
+                                    updated_metadata["run_id"] = metadata["run_id"]
+                                updated_metadata["updated_at"] = datetime.now(pytz.timezone("US/Pacific")).isoformat()
 
-                            self.vector_store.update(
-                                vector_id=memory_id,
-                                vector=None,  # Keep same embeddings
-                                payload=updated_metadata,
-                            )
-                            logger.info(f"Updated session IDs for memory {memory_id}")
+                                self.vector_store.update(
+                                    vector_id=memory_id,
+                                    vector=None,  # Keep same embeddings
+                                    payload=updated_metadata,
+                                )
+                                logger.info(f"Updated session IDs for memory {memory_id}")
                         else:
                             logger.info("NOOP for Memory.")
                 except Exception as e:
@@ -1873,6 +1876,9 @@ class AsyncMemory(MemoryBase):
                             # Create async task to update only the session identifiers
                             async def update_session_ids(mem_id, meta):
                                 existing_memory = await asyncio.to_thread(self.vector_store.get, vector_id=mem_id)
+                                if existing_memory is None:
+                                    logger.warning(f"Memory {mem_id} not found (may have been deleted), skipping session ID update")
+                                    return
                                 updated_metadata = deepcopy(existing_memory.payload)
                                 if meta.get("agent_id"):
                                     updated_metadata["agent_id"] = meta["agent_id"]
