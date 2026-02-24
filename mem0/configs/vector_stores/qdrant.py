@@ -17,6 +17,7 @@ class QdrantConfig(BaseModel):
     url: Optional[str] = Field(None, description="Full URL for Qdrant server")
     api_key: Optional[str] = Field(None, description="API key for Qdrant server")
     on_disk: Optional[bool] = Field(False, description="Enables persistent storage")
+    hybrid_search: Optional[bool] = Field(False, description="Enable BM25 hybrid search with RRF fusion")
 
     @model_validator(mode="before")
     @classmethod

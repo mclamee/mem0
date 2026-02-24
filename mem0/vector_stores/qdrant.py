@@ -2,7 +2,7 @@ import logging
 import os
 import shutil
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
     Distance,
     FieldCondition,
@@ -31,6 +31,7 @@ class Qdrant(VectorStoreBase):
         url: str = None,
         api_key: str = None,
         on_disk: bool = False,
+        hybrid_search: bool = False,
     ):
         """
         Initialize the Qdrant vector store.
@@ -38,13 +39,14 @@ class Qdrant(VectorStoreBase):
         Args:
             collection_name (str): Name of the collection.
             embedding_model_dims (int): Dimensions of the embedding model.
-            client (QdrantClient, optional): Existing Qdrant client instance. Defaults to None.
-            host (str, optional): Host address for Qdrant server. Defaults to None.
-            port (int, optional): Port for Qdrant server. Defaults to None.
-            path (str, optional): Path for local Qdrant database. Defaults to None.
-            url (str, optional): Full URL for Qdrant server. Defaults to None.
-            api_key (str, optional): API key for Qdrant server. Defaults to None.
+            client (QdrantClient, optional): Existing Qdrant client instance.
+            host (str, optional): Host address for Qdrant server.
+            port (int, optional): Port for Qdrant server.
+            path (str, optional): Path for local Qdrant database.
+            url (str, optional): Full URL for Qdrant server.
+            api_key (str, optional): API key for Qdrant server.
             on_disk (bool, optional): Enables persistent storage. Defaults to False.
+            hybrid_search (bool, optional): Enable BM25 hybrid search with RRF fusion. Defaults to False.
         """
         if client:
             self.client = client
@@ -58,7 +60,7 @@ class Qdrant(VectorStoreBase):
             if host and port:
                 params["host"] = host
                 params["port"] = port
-            
+
             if not params:
                 params["path"] = path
                 self.is_local = True
@@ -73,6 +75,7 @@ class Qdrant(VectorStoreBase):
         self.collection_name = collection_name
         self.embedding_model_dims = embedding_model_dims
         self.on_disk = on_disk
+        self.hybrid_search = hybrid_search
         self.create_col(embedding_model_dims, on_disk)
 
     def create_col(self, vector_size: int, on_disk: bool, distance: Distance = Distance.COSINE):
@@ -82,7 +85,7 @@ class Qdrant(VectorStoreBase):
         Args:
             vector_size (int): Size of the vectors to be stored.
             on_disk (bool): Enables persistent storage.
-            distance (Distance, optional): Distance metric for vector similarity. Defaults to Distance.COSINE.
+            distance (Distance, optional): Distance metric. Defaults to Distance.COSINE.
         """
         # Skip creating collection if already exists
         response = self.list_cols()
@@ -92,10 +95,25 @@ class Qdrant(VectorStoreBase):
                 self._create_filter_indexes()
                 return
 
-        self.client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=VectorParams(size=vector_size, distance=distance, on_disk=on_disk),
-        )
+        if self.hybrid_search:
+            # Named vectors: dense + BM25 sparse
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "dense": VectorParams(size=vector_size, distance=distance, on_disk=on_disk),
+                },
+                sparse_vectors_config={
+                    "bm25": models.SparseVectorParams(
+                        modifier=models.Modifier.IDF,
+                    ),
+                },
+            )
+        else:
+            # Anonymous vectors (legacy mode)
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=vector_size, distance=distance, on_disk=on_disk),
+            )
         self._create_filter_indexes()
 
     def _create_filter_indexes(self):
@@ -104,9 +122,9 @@ class Qdrant(VectorStoreBase):
         if self.is_local:
             logger.debug("Skipping payload index creation for local Qdrant (not supported)")
             return
-            
+
         common_fields = ["user_id", "agent_id", "run_id", "actor_id"]
-        
+
         for field in common_fields:
             try:
                 self.client.create_payload_index(
@@ -118,24 +136,54 @@ class Qdrant(VectorStoreBase):
             except Exception as e:
                 logger.debug(f"Index for {field} might already exist: {e}")
 
+    def _build_bm25_document(self, text: str) -> models.Document:
+        """Build a BM25 Document for sparse vector indexing."""
+        return models.Document(
+            text=text,
+            model="Qdrant/bm25",
+            options=models.Bm25Config(
+                tokenizer=models.TokenizerType.MULTILINGUAL,
+                language="none",
+            ),
+        )
+
     def insert(self, vectors: list, payloads: list = None, ids: list = None):
         """
         Insert vectors into a collection.
 
         Args:
             vectors (list): List of vectors to insert.
-            payloads (list, optional): List of payloads corresponding to vectors. Defaults to None.
-            ids (list, optional): List of IDs corresponding to vectors. Defaults to None.
+            payloads (list, optional): List of payloads corresponding to vectors.
+            ids (list, optional): List of IDs corresponding to vectors.
         """
         logger.info(f"Inserting {len(vectors)} vectors into collection {self.collection_name}")
-        points = [
-            PointStruct(
-                id=idx if ids is None else ids[idx],
-                vector=vector,
-                payload=payloads[idx] if payloads else {},
-            )
-            for idx, vector in enumerate(vectors)
-        ]
+
+        if self.hybrid_search:
+            points = []
+            for idx, vector in enumerate(vectors):
+                point_id = idx if ids is None else ids[idx]
+                payload = payloads[idx] if payloads else {}
+                text = payload.get("data", "") if payload else ""
+
+                point = PointStruct(
+                    id=point_id,
+                    vector={
+                        "dense": vector,
+                        "bm25": self._build_bm25_document(text),
+                    },
+                    payload=payload,
+                )
+                points.append(point)
+        else:
+            points = [
+                PointStruct(
+                    id=idx if ids is None else ids[idx],
+                    vector=vector,
+                    payload=payloads[idx] if payloads else {},
+                )
+                for idx, vector in enumerate(vectors)
+            ]
+
         self.client.upsert(collection_name=self.collection_name, points=points)
 
     def _create_filter(self, filters: dict) -> Filter:
@@ -150,7 +198,7 @@ class Qdrant(VectorStoreBase):
         """
         if not filters:
             return None
-            
+
         conditions = []
         for key, value in filters.items():
             if isinstance(value, dict) and "gte" in value and "lte" in value:
@@ -164,21 +212,47 @@ class Qdrant(VectorStoreBase):
         Search for similar vectors.
 
         Args:
-            query (str): Query.
+            query (str): Query text (used for BM25 in hybrid mode).
             vectors (list): Query vector.
             limit (int, optional): Number of results to return. Defaults to 5.
-            filters (dict, optional): Filters to apply to the search. Defaults to None.
+            filters (dict, optional): Filters to apply to the search.
 
         Returns:
             list: Search results.
         """
         query_filter = self._create_filter(filters) if filters else None
-        hits = self.client.query_points(
-            collection_name=self.collection_name,
-            query=vectors,
-            query_filter=query_filter,
-            limit=limit,
-        )
+
+        if self.hybrid_search:
+            # Hybrid search: dense + BM25 prefetch, RRF fusion
+            prefetch_limit = 20
+            hits = self.client.query_points(
+                collection_name=self.collection_name,
+                prefetch=[
+                    models.Prefetch(
+                        query=vectors,
+                        using="dense",
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                    models.Prefetch(
+                        query=self._build_bm25_document(query),
+                        using="bm25",
+                        limit=prefetch_limit,
+                        filter=query_filter,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=limit,
+            )
+        else:
+            # Pure dense search (legacy mode)
+            hits = self.client.query_points(
+                collection_name=self.collection_name,
+                query=vectors,
+                query_filter=query_filter,
+                limit=limit,
+            )
+
         return hits.points
 
     def delete(self, vector_id: int):
@@ -201,8 +275,8 @@ class Qdrant(VectorStoreBase):
 
         Args:
             vector_id (int): ID of the vector to update.
-            vector (list, optional): Updated vector. Defaults to None.
-            payload (dict, optional): Updated payload. Defaults to None.
+            vector (list, optional): Updated vector.
+            payload (dict, optional): Updated payload.
         """
         if vector is None:
             # Only update payload, keep existing vector
@@ -213,8 +287,18 @@ class Qdrant(VectorStoreBase):
                     points=[vector_id],
                 )
         else:
-            # Update both vector and payload
-            point = PointStruct(id=vector_id, vector=vector, payload=payload)
+            if self.hybrid_search:
+                text = payload.get("data", "") if payload else ""
+                point = PointStruct(
+                    id=vector_id,
+                    vector={
+                        "dense": vector,
+                        "bm25": self._build_bm25_document(text),
+                    },
+                    payload=payload,
+                )
+            else:
+                point = PointStruct(id=vector_id, vector=vector, payload=payload)
             self.client.upsert(collection_name=self.collection_name, points=[point])
 
     def get(self, vector_id: int) -> dict:
@@ -257,7 +341,7 @@ class Qdrant(VectorStoreBase):
         List all vectors in a collection.
 
         Args:
-            filters (dict, optional): Filters to apply to the list. Defaults to None.
+            filters (dict, optional): Filters to apply to the list.
             limit (int, optional): Number of vectors to return. Defaults to 100.
 
         Returns:
