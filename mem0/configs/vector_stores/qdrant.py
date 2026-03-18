@@ -18,6 +18,8 @@ class QdrantConfig(BaseModel):
     api_key: Optional[str] = Field(None, description="API key for Qdrant server")
     on_disk: Optional[bool] = Field(False, description="Enables persistent storage")
     hybrid_search: Optional[bool] = Field(False, description="Enable BM25 hybrid search with RRF fusion")
+    hybrid_dense_prefetch: Optional[int] = Field(20, description="Prefetch limit for dense vector in hybrid search (higher = more dense influence)")
+    hybrid_bm25_prefetch: Optional[int] = Field(20, description="Prefetch limit for BM25 sparse vector in hybrid search (higher = more keyword influence)")
 
     @model_validator(mode="before")
     @classmethod

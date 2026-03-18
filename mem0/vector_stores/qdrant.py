@@ -32,6 +32,8 @@ class Qdrant(VectorStoreBase):
         api_key: str = None,
         on_disk: bool = False,
         hybrid_search: bool = False,
+        hybrid_dense_prefetch: int = 20,
+        hybrid_bm25_prefetch: int = 20,
     ):
         """
         Initialize the Qdrant vector store.
@@ -47,6 +49,8 @@ class Qdrant(VectorStoreBase):
             api_key (str, optional): API key for Qdrant server.
             on_disk (bool, optional): Enables persistent storage. Defaults to False.
             hybrid_search (bool, optional): Enable BM25 hybrid search with RRF fusion. Defaults to False.
+            hybrid_dense_prefetch (int, optional): Prefetch limit for dense vector in hybrid search. Defaults to 20.
+            hybrid_bm25_prefetch (int, optional): Prefetch limit for BM25 sparse vector in hybrid search. Defaults to 20.
         """
         if client:
             self.client = client
@@ -76,6 +80,8 @@ class Qdrant(VectorStoreBase):
         self.embedding_model_dims = embedding_model_dims
         self.on_disk = on_disk
         self.hybrid_search = hybrid_search
+        self.hybrid_dense_prefetch = hybrid_dense_prefetch
+        self.hybrid_bm25_prefetch = hybrid_bm25_prefetch
         self.create_col(embedding_model_dims, on_disk)
 
     def create_col(self, vector_size: int, on_disk: bool, distance: Distance = Distance.COSINE):
@@ -224,20 +230,21 @@ class Qdrant(VectorStoreBase):
 
         if self.hybrid_search:
             # Hybrid search: dense + BM25 prefetch, RRF fusion
-            prefetch_limit = 20
+            # Different prefetch limits control effective weighting:
+            # higher limit = more candidates = more influence in RRF ranking
             hits = self.client.query_points(
                 collection_name=self.collection_name,
                 prefetch=[
                     models.Prefetch(
                         query=vectors,
                         using="dense",
-                        limit=prefetch_limit,
+                        limit=self.hybrid_dense_prefetch,
                         filter=query_filter,
                     ),
                     models.Prefetch(
                         query=self._build_bm25_document(query),
                         using="bm25",
-                        limit=prefetch_limit,
+                        limit=self.hybrid_bm25_prefetch,
                         filter=query_filter,
                     ),
                 ],
