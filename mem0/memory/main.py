@@ -475,7 +475,7 @@ class Memory(MemoryBase):
                 system_prompt = system_prompt.replace("{category_names}", category_names_str)
                 logger.info(f"✅ Replaced {{category_names}} placeholder")
 
-            user_prompt = f"Input:\n{parsed_messages}"
+            user_prompt = f"Input:\n{parsed_messages}\n\nRespond in JSON format."
         else:
             # Use default prompts with structured fact extraction if enabled
             use_categories = None
@@ -1666,7 +1666,7 @@ class AsyncMemory(MemoryBase):
                 system_prompt = system_prompt.replace("{category_names}", json.dumps(category_names, ensure_ascii=False))
                 logger.info(f"✅ Replaced {{category_names}} placeholder (async)")
 
-            user_prompt = f"Input:\n{parsed_messages}"
+            user_prompt = f"Input:\n{parsed_messages}\n\nRespond in JSON format."
         else:
             system_prompt, user_prompt = get_fact_retrieval_messages(
                 parsed_messages,

@@ -19,14 +19,14 @@ def get_fact_retrieval_messages(message, is_agent_memory=False):
         tuple: (system_prompt, user_prompt)
     """
     if is_agent_memory:
-        return AGENT_MEMORY_EXTRACTION_PROMPT, f"Input:\n{message}"
+        return AGENT_MEMORY_EXTRACTION_PROMPT, f"Input:\n{message}\n\nRespond in JSON format."
     else:
-        return USER_MEMORY_EXTRACTION_PROMPT, f"Input:\n{message}"
+        return USER_MEMORY_EXTRACTION_PROMPT, f"Input:\n{message}\n\nRespond in JSON format."
 
 
 def get_fact_retrieval_messages_legacy(message):
     """Legacy function for backward compatibility."""
-    return FACT_RETRIEVAL_PROMPT, f"Input:\n{message}"
+    return FACT_RETRIEVAL_PROMPT, f"Input:\n{message}\n\nRespond in JSON format."
 
 
 def parse_messages(messages):
