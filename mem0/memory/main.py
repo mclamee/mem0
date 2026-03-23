@@ -1818,7 +1818,18 @@ class AsyncMemory(MemoryBase):
                     new_memories_with_actions = {}
                 else:
                     response = remove_code_blocks(response)
-                    new_memories_with_actions = json.loads(response)
+                    try:
+                        new_memories_with_actions = json.loads(response)
+                    except json.JSONDecodeError:
+                        try:
+                            from json_repair import repair_json  # noqa: PLC0415
+                            repaired = repair_json(response)
+                            new_memories_with_actions = json.loads(repaired) if repaired else {}
+                            logger.warning(f"Repaired truncated JSON response ({len(response)} chars)")
+                        except Exception as repair_err:
+                            raise json.JSONDecodeError(
+                                f"json_repair also failed: {repair_err}", response, 0
+                            )
                     logger.info(f"[DEBUG] Parsed JSON with {len(new_memories_with_actions.get('memory', []))} memory actions")
             except Exception as e:
                 logger.error(f"Invalid JSON response: {e}, response preview: {response[:200] if response else 'None'}")
