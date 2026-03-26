@@ -469,7 +469,6 @@ class Memory(MemoryBase):
 
             # Replace {category_names} placeholder with list of category names
             if "{category_names}" in system_prompt and effective_categories:
-                import json
                 category_names = list(effective_categories.keys())
                 category_names_str = json.dumps(category_names, ensure_ascii=False)
                 system_prompt = system_prompt.replace("{category_names}", category_names_str)
@@ -521,10 +520,15 @@ class Memory(MemoryBase):
                         ]
                         logger.info(f"Extracted {len(new_retrieved_facts)} legacy facts (converted to structured)")
 
-                except json.JSONDecodeError:
-                    # Try extracting JSON from response using built-in function
+                except (json.JSONDecodeError, KeyError):
+                    # Try extracting JSON from response, then fall back to json_repair
                     extracted_json = extract_json(response)
-                    facts_response = json.loads(extracted_json)["facts"]
+                    try:
+                        facts_response = json.loads(extracted_json)["facts"]
+                    except (json.JSONDecodeError, KeyError):
+                        from json_repair import repair_json
+                        repaired = repair_json(response)
+                        facts_response = json.loads(repaired).get("facts", [])
 
                     # Same format handling as above
                     if facts_response and isinstance(facts_response[0], dict):
@@ -1661,7 +1665,6 @@ class AsyncMemory(MemoryBase):
 
             # Replace {category_names} placeholder with list of category names
             if "{category_names}" in system_prompt and effective_categories:
-                import json
                 category_names = list(effective_categories.keys())
                 system_prompt = system_prompt.replace("{category_names}", json.dumps(category_names, ensure_ascii=False))
                 logger.info(f"✅ Replaced {{category_names}} placeholder (async)")
@@ -1687,10 +1690,15 @@ class AsyncMemory(MemoryBase):
                 try:
                     # First try direct JSON parsing
                     facts_response = json.loads(response)["facts"]
-                except json.JSONDecodeError:
-                    # Try extracting JSON from response using built-in function
+                except (json.JSONDecodeError, KeyError):
+                    # Try extracting JSON from response, then fall back to json_repair
                     extracted_json = extract_json(response)
-                    facts_response = json.loads(extracted_json)["facts"]
+                    try:
+                        facts_response = json.loads(extracted_json)["facts"]
+                    except (json.JSONDecodeError, KeyError):
+                        from json_repair import repair_json
+                        repaired = repair_json(response)
+                        facts_response = json.loads(repaired).get("facts", [])
 
                 # Handle both structured and legacy fact formats
                 # Structured: [{"text": "...", "category": "...", "date": "..."}]
