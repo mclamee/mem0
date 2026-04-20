@@ -666,8 +666,20 @@ class Memory(MemoryBase):
 
                     # Merge all metadata fields dynamically
                     memory_metadata = deepcopy(metadata)
-                    if action_text in fact_metadata_map:
-                        fact_meta = fact_metadata_map[action_text]
+                    # UPDATE LLM may rewrite text (drop date prefix, rephrase),
+                    # so exact match can fail — use substring fallback
+                    fact_meta = fact_metadata_map.get(action_text)
+                    if fact_meta is None and fact_metadata_map:
+                        for key, meta in fact_metadata_map.items():
+                            original = key.split("，", 1)[-1] if "，" in key else key
+                            if original in action_text or action_text in key:
+                                fact_meta = meta
+                                logger.warning(
+                                    f"fact_metadata_map substring fallback: "
+                                    f"action_text='{action_text[:60]}' matched key='{key[:60]}'"
+                                )
+                                break
+                    if fact_meta:
                         # Copy all metadata fields from fact extraction
                         # This supports custom fields like 'role', 'source', 'confidence', etc.
                         for key, value in fact_meta.items():
@@ -1860,8 +1872,20 @@ class AsyncMemory(MemoryBase):
                     # Merge category metadata if available (async)
                     memory_metadata = deepcopy(metadata)
                     # action_text is already date-prefixed from format_fact_text
-                    if action_text in fact_metadata_map:
-                        fact_meta = fact_metadata_map[action_text]
+                    # UPDATE LLM may rewrite text (drop date prefix, rephrase),
+                    # so exact match can fail — use substring fallback
+                    fact_meta = fact_metadata_map.get(action_text)
+                    if fact_meta is None and fact_metadata_map:
+                        for key, meta in fact_metadata_map.items():
+                            original = key.split("，", 1)[-1] if "，" in key else key
+                            if original in action_text or action_text in key:
+                                fact_meta = meta
+                                logger.warning(
+                                    f"fact_metadata_map substring fallback: "
+                                    f"action_text='{action_text[:60]}' matched key='{key[:60]}'"
+                                )
+                                break
+                    if fact_meta:
                         memory_metadata["category"] = fact_meta.get("category", "unknown")
                         if fact_meta.get("date"):
                             memory_metadata["date"] = fact_meta["date"]
