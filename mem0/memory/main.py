@@ -169,6 +169,49 @@ setup_config()
 logger = logging.getLogger(__name__)
 
 
+def _lookup_fact_metadata(action_text: str, fact_metadata_map: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Look up metadata for an action_text from the fact_metadata_map.
+
+    Tries exact match first. On miss, falls back to substring match with two
+    guards to prevent wrong-metadata attachment:
+
+    - Uniqueness guard: only accept when exactly ONE candidate key matches.
+      Ambiguous matches are logged and return None (better no metadata than wrong).
+    - Length-ratio guard: reject matches where the shorter side is <12 chars
+      and <50% of the longer side, to avoid short-text collisions like
+      "likes tea" falsely matching "likes tea but hates coffee".
+    """
+    fact_meta = fact_metadata_map.get(action_text)
+    if fact_meta is not None or not fact_metadata_map:
+        return fact_meta
+
+    candidates = []
+    for key, meta in fact_metadata_map.items():
+        original = key.split("，", 1)[-1] if "，" in key else key
+        shorter = min(len(original), len(action_text))
+        longer = max(len(original), len(action_text))
+        if longer == 0 or (shorter < 12 and shorter / longer < 0.5):
+            continue
+        if original in action_text or action_text in key:
+            candidates.append((key, meta))
+
+    if len(candidates) == 1:
+        key, meta = candidates[0]
+        logger.warning(
+            "fact_metadata_map substring fallback: "
+            f"action_text='{action_text[:60]}' matched key='{key[:60]}'"
+        )
+        return meta
+    if len(candidates) > 1:
+        keys_preview = [c[0][:40] for c in candidates[:3]]
+        logger.warning(
+            "fact_metadata_map substring fallback skipped (ambiguous): "
+            f"action_text='{action_text[:60]}' had {len(candidates)} candidates, "
+            f"first 3 keys={keys_preview}"
+        )
+    return None
+
+
 class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
@@ -664,26 +707,11 @@ class Memory(MemoryBase):
 
                     event_type = resp.get("event")
 
-                    # Merge all metadata fields dynamically
                     memory_metadata = deepcopy(metadata)
-                    # UPDATE LLM may rewrite text (drop date prefix, rephrase),
-                    # so exact match can fail — use substring fallback
-                    fact_meta = fact_metadata_map.get(action_text)
-                    if fact_meta is None and fact_metadata_map:
-                        for key, meta in fact_metadata_map.items():
-                            original = key.split("，", 1)[-1] if "，" in key else key
-                            if original in action_text or action_text in key:
-                                fact_meta = meta
-                                logger.warning(
-                                    f"fact_metadata_map substring fallback: "
-                                    f"action_text='{action_text[:60]}' matched key='{key[:60]}'"
-                                )
-                                break
+                    fact_meta = _lookup_fact_metadata(action_text, fact_metadata_map)
                     if fact_meta:
-                        # Copy all metadata fields from fact extraction
-                        # This supports custom fields like 'role', 'source', 'confidence', etc.
                         for key, value in fact_meta.items():
-                            if value is not None:  # Only set non-None values
+                            if value is not None:
                                 memory_metadata[key] = value
 
                     if event_type == "ADD":
@@ -1869,26 +1897,12 @@ class AsyncMemory(MemoryBase):
                         continue
                     event_type = resp.get("event")
 
-                    # Merge category metadata if available (async)
                     memory_metadata = deepcopy(metadata)
-                    # action_text is already date-prefixed from format_fact_text
-                    # UPDATE LLM may rewrite text (drop date prefix, rephrase),
-                    # so exact match can fail — use substring fallback
-                    fact_meta = fact_metadata_map.get(action_text)
-                    if fact_meta is None and fact_metadata_map:
-                        for key, meta in fact_metadata_map.items():
-                            original = key.split("，", 1)[-1] if "，" in key else key
-                            if original in action_text or action_text in key:
-                                fact_meta = meta
-                                logger.warning(
-                                    f"fact_metadata_map substring fallback: "
-                                    f"action_text='{action_text[:60]}' matched key='{key[:60]}'"
-                                )
-                                break
+                    fact_meta = _lookup_fact_metadata(action_text, fact_metadata_map)
                     if fact_meta:
-                        memory_metadata["category"] = fact_meta.get("category", "unknown")
-                        if fact_meta.get("date"):
-                            memory_metadata["date"] = fact_meta["date"]
+                        for key, value in fact_meta.items():
+                            if value is not None:
+                                memory_metadata[key] = value
 
                     if event_type == "ADD":
                         task = asyncio.create_task(
