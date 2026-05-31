@@ -1,0 +1,63 @@
+name: PR Merge Feishu Notify
+
+# Self-contained PR-merge Feishu card for cross-org repos that can't call
+# dora-agi/dora's org-scoped reusable workflow or use its self-hosted runner.
+# Runs on github-hosted ubuntu and posts via a Feishu custom-bot webhook.
+#
+# Enable by setting repo secret LARK_WEBHOOK_URL (custom-bot incoming webhook
+# of the 龙虾任务二号 group). Until then the job no-ops.
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Feishu card via custom-bot webhook
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          PR_BASE: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD: ${{ github.event.pull_request.head.ref }}
+          PR_ADDS: ${{ github.event.pull_request.additions }}
+          PR_DELS: ${{ github.event.pull_request.deletions }}
+          PR_FILES: ${{ github.event.pull_request.changed_files }}
+          PR_REPO: ${{ github.event.repository.name }}
+          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
+        run: |
+          set -uo pipefail
+          if [ -z "${LARK_WEBHOOK_URL:-}" ]; then
+            echo "LARK_WEBHOOK_URL secret unset — skipping (set it to enable)."; exit 0
+          fi
+          MERGED_BJ=$(python3 -c "import datetime,sys; s=sys.argv[1]; print((datetime.datetime.fromisoformat(s.replace('Z','+00:00'))+datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M') if s else '')" "${PR_MERGED_AT:-}" 2>/dev/null || true)
+          CARD=$(jq -n \
+            --arg title "$PR_TITLE" --arg author "$PR_AUTHOR" --arg mergedby "$PR_MERGED_BY" \
+            --arg head "$PR_HEAD" --arg base "$PR_BASE" \
+            --arg adds "$PR_ADDS" --arg dels "$PR_DELS" --arg files "$PR_FILES" \
+            --arg url "$PR_URL" --arg repo "$PR_REPO" --arg mtime "$MERGED_BJ" \
+            --arg htitle "🔀 ${PR_REPO} PR #${PR_NUMBER} merged" \
+            '{schema:"2.0",config:{wide_screen_mode:true},
+              header:{template:"green",title:{tag:"plain_text",content:$htitle}},
+              body:{elements:(
+                [{tag:"markdown",content:("**"+$title+"**")},
+                 {tag:"hr"},
+                 {tag:"markdown",content:(
+                    "**仓库** `"+$repo+"`"
+                    + "\n**作者** "+$author+"　·　**合并** "+$mergedby
+                    + (if $mtime != "" then "　·　**合并时间** "+$mtime+"（北京时间）" else "" end)
+                    + "\n**分支** `"+$head+"` → `"+$base+"`"
+                    + "\n**改动** +"+$adds+" / -"+$dels+" · "+$files+" files")}]
+                + (if $url != "" then [{tag:"button",text:{tag:"plain_text",content:"查看 PR"},type:"primary",width:"default",behaviors:[{type:"open_url",default_url:$url}]}] else [] end)
+              )}}')
+          PAYLOAD=$(jq -n --argjson card "$CARD" '{msg_type:"interactive",card:$card}')
+          RESP=$(curl -s -X POST "$LARK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD")
+          echo "webhook resp: $RESP"
+          echo "$RESP" | jq -e '.code == 0 or .StatusCode == 0' >/dev/null 2>&1 \
+            && echo "card sent ✓" || echo "(webhook send may have failed — non-fatal)"
